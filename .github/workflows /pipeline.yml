@@ -1,0 +1,125 @@
+name: Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      raw_s3_path:
+        description: "RAW data S3 path"
+        required: true
+      clean_s3_path:
+        description: "CLEAN data S3 path"
+        required: true
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+   
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+ 
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform
+
+   
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="raw_s3_path=${{ github.event.inputs.raw_s3_path }}" \
+            -var="clean_s3_path=${{ github.event.inputs.clean_s3_path }}"
+        working-directory: terraform
+
+      
+      - name: Run Glue Job
+        shell: bash
+        run: |
+          set -e
+
+          echo "Starting Glue Job..."
+          JOB_RUN_ID=$(aws glue start-job-run \
+            --job-name liquor-sales-cleaning-job \
+            --arguments "{\"--RAW_S3_PATH\":\"${{ github.event.inputs.raw_s3_path }}\",\"--CLEAN_S3_PATH\":\"${{ github.event.inputs.clean_s3_path }}\"}" \
+            --query JobRunId \
+            --output text)
+
+          echo "JobRunId: $JOB_RUN_ID"
+
+          echo "Waiting for Glue Job to complete..."
+          while true; do
+            STATUS=$(aws glue get-job-run \
+              --job-name liquor-sales-cleaning-job \
+              --run-id $JOB_RUN_ID \
+              --query JobRun.JobRunState \
+              --output text)
+
+            echo "Current status: $STATUS"
+
+            if [ "$STATUS" = "SUCCEEDED" ]; then
+              echo "Glue Job completed successfully"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "STOPPED" ] || [ "$STATUS" = "TIMEOUT" ]; then
+              echo "Glue Job failed"
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+     
+      - name: Ensure and Run Glue Crawler
+        shell: bash
+        run: |
+          set -e
+
+          CRAWLER_NAME="liquor-cleaned-crawler"
+          DATABASE_NAME="liquor_sales_database"
+          ROLE_NAME="AWSGlueServiceRole-liquor"
+          CLEAN_PATH="${{ github.event.inputs.clean_s3_path }}"
+
+          echo "Checking if crawler exists..."
+
+          if aws glue get-crawler --name "$CRAWLER_NAME" >/dev/null 2>&1; then
+            echo "Crawler already exists"
+          else
+            echo "Creating crawler..."
+            aws glue create-crawler \
+              --name "$CRAWLER_NAME" \
+              --role "$ROLE_NAME" \
+              --database-name "$DATABASE_NAME" \
+              --targets S3Targets=[{Path="$CLEAN_PATH"}] \
+              --schema-change-policy UpdateBehavior=UPDATE_IN_DATABASE,DeleteBehavior=LOG
+          fi
+
+          echo "Starting crawler..."
+          aws glue start-crawler --name "$CRAWLER_NAME"
+
+          echo "Waiting for crawler to finish..."
+          while true; do
+            STATE=$(aws glue get-crawler \
+              --name "$CRAWLER_NAME" \
+              --query 'Crawler.State' \
+              --output text)
+
+            echo "Crawler state: $STATE"
+
+            if [ "$STATE" = "READY" ]; then
+              echo "Crawler completed successfully"
+              break
+            fi
+
+            sleep 30
+          done
